@@ -48,8 +48,8 @@ The D1 binding name is fixed to `DB`.
 ## Routes
 
 - `POST /interactions` — Discord Interactions Endpoint
-- `GET /health` — connection check used by SRL
-- `GET /setup/status` — checks the real Discord Message Command registration
+- `GET /health` — checks that the D1 `handoffs` table is queryable and reports whether each Discord variable is present (never returns secret values)
+- `GET /setup/status` — checks that the Bot Token is valid, verifies the configured Application ID and Public Key belong to that Discord App, and reports Message Command registration
 - `POST /setup/register` — registers the `保存到资源库` Message Context Command
 - `POST /source/read` — authenticated, bounded, read-only source check used by SRL
 - `POST /source/messages/check` — checks a bounded batch of explicitly saved message IDs
@@ -57,6 +57,8 @@ The D1 binding name is fixed to `DB`.
 - `GET /open/:token` — opens SRL with the handoff token
 
 Users normally do not need to type these routes. SRL derives them automatically from the Worker root URL. For Android and iOS web apps / PWAs, the `/open/:token` page can copy a temporary link to paste inside the app; this keeps the handoff in that app's own local storage context and does not require an SRL site URL setting. Large handoffs are split across temporary D1 rows, so there is no Bridge-specific per-handoff size cap; Cloudflare account and database quotas still apply.
+
+The SRL deployment diagnostics use the expanded `/health` and `/setup/status` responses from this Worker. After syncing this repository into a GitHub fork, Cloudflare Workers Builds must deploy the updated production branch before those diagnostics can inspect the D1 migration table and compare Discord credentials. Older Bridge deployments continue to serve the existing interaction and handoff routes.
 
 ## Deploy without GitHub / GitLab
 

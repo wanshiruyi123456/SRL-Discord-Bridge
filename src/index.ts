@@ -533,6 +533,23 @@ function discordApplicationCommandsUrl(env: Env): string {
   return `https://discord.com/api/v10/applications/${encodeURIComponent(env.DISCORD_APPLICATION_ID)}/commands`
 }
 
+function discordVariableStatus(env: Env) {
+  return {
+    applicationId: Boolean(env.DISCORD_APPLICATION_ID?.trim()),
+    publicKey: Boolean(env.DISCORD_PUBLIC_KEY?.trim()),
+    botToken: Boolean(env.DISCORD_BOT_TOKEN?.trim()),
+  }
+}
+
+async function readCurrentBotApplication(env: Env): Promise<Record<string, unknown>> {
+  const response = await fetch('https://discord.com/api/v10/oauth2/applications/@me', {
+    headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+  })
+  const application = asRecord(await discordJson(response, 'Discord bot application check'))
+  if (!application) throw new Error('Discord bot application response invalid')
+  return application
+}
+
 async function registerMessageCommand(env: Env): Promise<void> {
   if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_BOT_TOKEN) {
     throw new Error('Discord Application ID / Bot Token 未配置')
@@ -1350,30 +1367,47 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS })
 
     if (url.pathname === '/health' && request.method === 'GET') {
+      const discordVariables = discordVariableStatus(env)
+      const discordConfigured = Object.values(discordVariables).every(Boolean)
       try {
-        await env.DB.prepare('SELECT 1').first()
+        await env.DB.prepare('SELECT 1 FROM handoffs LIMIT 1').first()
         return json({
           ok: true,
           database: true,
-          discordConfigured: Boolean(
-            env.DISCORD_APPLICATION_ID && env.DISCORD_PUBLIC_KEY && env.DISCORD_BOT_TOKEN,
-          ),
+          discordConfigured,
+          discordVariables,
           applicationId: env.DISCORD_APPLICATION_ID || null,
           commandName: COMMAND_NAME,
         })
       } catch {
-        return json({ ok: false, database: false }, { status: 503 })
+        return json(
+          {
+            ok: false,
+            database: false,
+            discordConfigured,
+            discordVariables,
+            applicationId: env.DISCORD_APPLICATION_ID || null,
+          },
+          { status: 503 },
+        )
       }
     }
 
     if (url.pathname === '/setup/status' && request.method === 'GET') {
       if (!authorizedSetup(request, env)) return json({ error: 'unauthorized' }, { status: 401 })
       try {
+        const botApplication = await readCurrentBotApplication(env)
+        const applicationIdMatches = asString(botApplication.id) === env.DISCORD_APPLICATION_ID
+        const publicKeyMatches =
+          asString(botApplication.verify_key).toLowerCase() ===
+          (env.DISCORD_PUBLIC_KEY ?? '').trim().toLowerCase()
         return json({
           ok: true,
           applicationId: env.DISCORD_APPLICATION_ID,
+          applicationIdMatches,
+          publicKeyMatches,
           commandName: COMMAND_NAME,
-          commandRegistered: await readMessageCommandStatus(env),
+          commandRegistered: applicationIdMatches ? await readMessageCommandStatus(env) : false,
         })
       } catch (error) {
         return json(
