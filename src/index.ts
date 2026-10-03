@@ -32,8 +32,9 @@ import {
 } from './DiscordWorkerHttp'
 
 const COMMAND_NAME = '保存到资源库'
-const POST_COMMAND_NAME = '保存帖子到SRL'
-const RESOURCE_COMMAND_NAME = '下载资源到SRL'
+const POST_COMMAND_NAME = '保存帖子到SRL（云端暂存）'
+const RESOURCE_COMMAND_NAME = '下载资源到SRL（云端暂存）'
+const DIRECT_RESOURCE_COMMAND_NAME = '下载直链'
 const PAIR_COMMAND_NAME = '绑定资源库'
 const INLINE_HANDOFF_MAX_BYTES = 1_800_000
 const HANDOFF_CHUNK_CHARACTERS = 250_000
@@ -216,10 +217,33 @@ async function registerMessageCommand(env: Env): Promise<void> {
   if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_BOT_TOKEN) {
     throw new Error('Discord Application ID / Bot Token 未配置')
   }
+  const existingResponse = await fetch(discordApplicationCommandsUrl(env), {
+    headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+  })
+  const existing = await discordJson(existingResponse, 'Discord command migration read')
+  if (!Array.isArray(existing)) throw new Error('Discord command list invalid')
+  const renamedCommands = new Map([
+    [POST_COMMAND_NAME, '保存帖子到SRL'],
+    [RESOURCE_COMMAND_NAME, '下载资源到SRL'],
+  ])
   const commands = [
     { name: COMMAND_NAME, type: 3 },
     { name: POST_COMMAND_NAME, type: 3 },
     { name: RESOURCE_COMMAND_NAME, type: 3 },
+    {
+      name: DIRECT_RESOURCE_COMMAND_NAME,
+      type: 1,
+      description: '将 Discord 附件直链云端暂存到已配对资源库，不保存帖子',
+      options: [
+        {
+          name: '链接',
+          type: 3,
+          description: 'Discord 文件下载直链，不是消息地址',
+          required: true,
+          max_length: 4096,
+        },
+      ],
+    },
     {
       name: PAIR_COMMAND_NAME,
       type: 1,
@@ -228,20 +252,50 @@ async function registerMessageCommand(env: Env): Promise<void> {
     },
   ]
   for (const command of commands) {
-    const response = await fetch(discordApplicationCommandsUrl(env), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ...command,
-        integration_types: [1],
-        contexts: [0, 1, 2],
-      }),
+    const previousName = renamedCommands.get(command.name)
+    const oldCommand = existing
+      .map(asRecord)
+      .find(
+        (item) =>
+          previousName !== undefined &&
+          item?.name === previousName &&
+          item?.type === command.type &&
+          typeof item?.id === 'string',
+      )
+    const alreadyRenamed = existing.some((item) => {
+      const value = asRecord(item)
+      return value?.name === command.name && value?.type === command.type
     })
+    const migrate = oldCommand && !alreadyRenamed
+    const response = await fetch(
+      discordApplicationCommandsUrl(env) +
+        (migrate ? '/' + encodeURIComponent(asString(oldCommand.id)) : ''),
+      {
+        method: migrate ? 'PATCH' : 'POST',
+        headers: {
+          Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...command,
+          integration_types: [1],
+          contexts: [0, 1, 2],
+        }),
+      },
+    )
     if (!response.ok) {
       throw new Error(`Discord command registration failed: ${response.status}`)
+    }
+    if (oldCommand && alreadyRenamed) {
+      const removed = await fetch(
+        discordApplicationCommandsUrl(env) + '/' + encodeURIComponent(asString(oldCommand.id)),
+        {
+          method: 'DELETE',
+          headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+        },
+      )
+      if (!removed.ok && removed.status !== 404)
+        throw new Error(`Discord old command removal failed: ${removed.status}`)
     }
   }
 }
@@ -260,6 +314,7 @@ async function readMessageCommandStatus(env: Env): Promise<boolean> {
     [COMMAND_NAME, 3],
     [POST_COMMAND_NAME, 3],
     [RESOURCE_COMMAND_NAME, 3],
+    [DIRECT_RESOURCE_COMMAND_NAME, 1],
     [PAIR_COMMAND_NAME, 1],
   ].every(([name, type]) =>
     payload.some((item) => {
@@ -393,14 +448,30 @@ function openPage(request: Request, token: string): Response {
   const nativeUrl = `srl://discord-source?worker=${encodeURIComponent(origin)}&token=${encodeURIComponent(token)}`
   const handoffUrl = `${origin}/open/${encodeURIComponent(token)}`
   return html(`<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>打开 SRL</title>
-<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:0 auto;padding:32px 20px;color:#173641;background:#f5fafb}h1{font-size:1.35rem}p{color:#647b83;line-height:1.65}.a{display:block;width:100%;margin-top:12px;padding:12px 14px;border:1px solid #bfd0d4;border-radius:8px;color:#315e6d;text-decoration:none;font:inherit;font-weight:700;text-align:left;cursor:pointer}.hint{font-size:.82rem;color:#82949b}.handoff-fallback[hidden]{display:none}</style></head>
-<body><h1 id="delivery-heading">Discord 来源已接收</h1><p id="delivery-state" role="status">消息正在你自己的 Worker 中临时等待领取。请复制临时链接，回到正在使用的 SRL 网页 / PWA 粘贴领取，内容会保存到当前应用的资源库。</p>
-<button class="a" id="refresh-state" type="button">刷新接收进度</button>
-<a class="a" href="${escapeHtml(nativeUrl)}">打开 SRL Android App</a>
-<button class="a" id="copy-handoff" type="button" data-handoff-url="${escapeHtml(handoffUrl)}">复制临时链接，回网页 / PWA 粘贴领取</button>
-<input class="a handoff-fallback" id="handoff-fallback" type="url" value="${escapeHtml(handoffUrl)}" readonly aria-label="临时领取链接" hidden>
-<p class="hint" id="copy-status" role="status">链接会自动过期。新帖子投递会在本机保存成功后确认；旧分享链接仍为一次性领取。</p>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark"><title>接收 Discord 帖子 · SRL</title>
+<style>
+:root{color-scheme:light dark;--bg:#f3f6f4;--surface:#fff;--ink:#233b37;--muted:#64766f;--line:#dbe5df;--tint:#eef5f0;--accent:#28694e;--on-accent:#fff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:"PingFang SC","Microsoft YaHei",sans-serif;font-size:15px;line-height:1.6}
+main{width:100%;max-width:480px;margin:0 auto;padding:calc(36px + env(safe-area-inset-top)) max(20px,env(safe-area-inset-right)) calc(28px + env(safe-area-inset-bottom)) max(20px,env(safe-area-inset-left))}
+.brand{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;letter-spacing:.12em}.brand b{letter-spacing:0;color:var(--accent);font-size:14px}.brand i{width:1px;height:12px;background:var(--line)}
+h1{margin:25px 0 8px;font-size:27px;line-height:1.35;letter-spacing:-.03em}.intro{margin:0 0 24px;color:var(--muted);font-size:14px}
+.receipt{padding:16px 18px;border:1px solid var(--line);border-radius:16px;background:var(--surface)}.receipt-top{display:flex;align-items:center;justify-content:space-between;gap:8px}.status-label{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13px}.status-dot{width:7px;height:7px;flex:none;border-radius:50%;background:var(--accent)}
+#delivery-state{margin:4px 0 0;font-size:14px;overflow-wrap:anywhere}.refresh{display:inline-flex;align-items:center;justify-content:center;gap:5px;min-height:44px;padding:0 8px;margin:-6px -8px -6px 0;border:0;background:none;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;flex:none}
+.actions{margin-top:24px;display:grid;gap:10px}.action{display:flex;align-items:center;justify-content:space-between;gap:12px;width:100%;min-width:0;min-height:56px;padding:14px 18px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--ink);text-decoration:none;font:inherit;font-weight:600;text-align:left;white-space:normal;overflow-wrap:anywhere;cursor:pointer}.action span{min-width:0}.action svg,.refresh svg{flex:none;width:18px;height:18px}.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}.action:hover{filter:brightness(.97)}.action:focus-visible,.refresh:focus-visible,input:focus-visible{outline:3px solid var(--accent);outline-offset:3px}button:disabled{opacity:.55;cursor:wait}
+.web-help{margin:2px 3px 0;font-size:12px;color:var(--muted)}.handoff-fallback{width:100%;min-width:0;padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);font:inherit;font-size:13px}.handoff-fallback[hidden]{display:none}.note{margin:24px 0 0;padding-top:16px;border-top:1px solid var(--line);font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+@media(prefers-color-scheme:dark){:root{--bg:#18211e;--surface:#222e29;--ink:#e6ede8;--muted:#a1b4a8;--line:#35473c;--tint:#293c30;--accent:#9fcab1;--on-accent:#172b20}}
+</style></head>
+<body><main>
+<div class="brand"><b>SRL</b><i aria-hidden="true"></i><span>DISCORD 帖子接收</span></div>
+<h1 id="delivery-heading">帖子已暂存</h1><p class="intro">打开资源库，接着整理这条帖子。</p>
+<section class="receipt" aria-label="接收进度"><div class="receipt-top"><span class="status-label"><i class="status-dot" aria-hidden="true"></i>接收进度</span><button class="refresh" id="refresh-state" type="button" aria-label="刷新接收进度"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M20 10a8 8 0 0 0-14-5L3 8m0-5v5h5M4 14a8 8 0 0 0 14 5l3-3m0 5v-5h-5"/></svg>刷新</button></div><p id="delivery-state" role="status" aria-live="polite">正在读取接收进度…</p></section>
+<div class="actions">
+<a class="action primary" id="open-native" href="${escapeHtml(nativeUrl)}"><span>打开安卓 App</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></a>
+<button class="action" id="copy-handoff" type="button" data-handoff-url="${escapeHtml(handoffUrl)}"><span>复制领取链接</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M15 8V4H4v11h4"/></svg></button>
+<p class="web-help">网页 / iOS PWA：复制后回资源库，在连接设置中粘贴领取。</p>
+<input class="handoff-fallback" id="handoff-fallback" type="url" value="${escapeHtml(handoffUrl)}" readonly aria-label="临时领取链接" hidden>
+</div><p class="note" id="copy-status" role="status">临时链接会自动过期。帖子在本机保存成功后确认接收；原直传链接仅能领取一次。</p>
+</main>
 <script>
 async function updateDeliveryState() {
   const target = document.getElementById('delivery-state');
@@ -415,6 +486,8 @@ async function updateDeliveryState() {
       waiting_binding: '帖子已保存，等待你关联到资源。',
       expired: '临时链接已过期。请回 Discord 重新保存这条消息。'
     };
+    const heading = document.getElementById('delivery-heading');
+    if (heading) heading.textContent = ({ pending: '帖子已暂存', saved: '帖子已保存', waiting_binding: '等待关联资源', expired: '链接已过期' })[state.state] || '接收进度';
     if (target) target.textContent = (state.libraryName ? '目标：' + state.libraryName + '。' : '') + (labels[state.state] || '暂时无法读取状态，请稍后刷新。');
   } catch {
     if (target) target.textContent = '暂时无法读取状态，请稍后刷新。';
@@ -443,7 +516,7 @@ document.getElementById('copy-handoff')?.addEventListener('click', async (event)
   }
   const status = document.getElementById('copy-status');
   if (copied) {
-    if (status) status.textContent = '已复制。请切回 SRL 网页 / PWA，打开来源链接高级设置并粘贴领取。';
+    if (status) status.textContent = '已复制。请切回 SRL 网页 / PWA，打开收件箱的连接设置并粘贴领取。';
   } else {
     const fallback = document.getElementById('handoff-fallback');
     if (fallback instanceof HTMLInputElement) {
@@ -483,11 +556,14 @@ async function handleInteraction(
   const isPairCommand =
     interaction.type === 2 && interaction.data?.type === 1 && commandName === PAIR_COMMAND_NAME
   const isPostCommand =
-    interaction.type === 2 && interaction.data?.type === 3 && commandName === POST_COMMAND_NAME
-  if (
     interaction.type === 2 &&
     interaction.data?.type === 3 &&
-    commandName === RESOURCE_COMMAND_NAME
+    (commandName === POST_COMMAND_NAME || commandName === '保存帖子到SRL')
+  if (
+    interaction.type === 2 &&
+    ((interaction.data?.type === 3 &&
+      (commandName === RESOURCE_COMMAND_NAME || commandName === '下载资源到SRL')) ||
+      (interaction.data?.type === 1 && commandName === DIRECT_RESOURCE_COMMAND_NAME))
   ) {
     ctx.waitUntil(
       (async () => {
@@ -602,6 +678,7 @@ export default {
           commandName: COMMAND_NAME,
           postCommandName: POST_COMMAND_NAME,
           resourceCommandName: RESOURCE_COMMAND_NAME,
+          directResourceCommandName: DIRECT_RESOURCE_COMMAND_NAME,
           pairCommandName: PAIR_COMMAND_NAME,
         })
       } catch {

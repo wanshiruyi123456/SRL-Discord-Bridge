@@ -98,13 +98,21 @@ export async function createResourceJobs(
   const messageId = interaction.data?.target_id
   const message = messageId ? interaction.data?.resolved?.messages?.[messageId] : undefined
   const channelId = asString(message?.channel_id) || interaction.channel_id
-  if (!userId || !message || !validSnowflake(messageId) || !validSnowflake(channelId))
+  const direct = interaction.data?.type === 1 && interaction.data.name === '下载直链'
+  if (
+    !userId ||
+    (!direct && (!message || !validSnowflake(messageId) || !validSnowflake(channelId)))
+  )
     throw new InboxError(400, 'Discord 未提供完整的目标消息')
-  const files = messageAttachments(message)
+  const link = interaction.data?.options?.find(
+    (option) => option.name === '链接' && option.type === 3,
+  )?.value
+  const file = direct && typeof link === 'string' ? attachment(link.trim()) : undefined
+  const files = direct ? (file ? [file] : []) : messageAttachments(message!)
   if (!files.length)
     throw new InboxError(
       400,
-      '没有找到可导入的 Discord 附件直链。支持 PNG、JSON、ZIP、TXT、聊天文件和图片；保存正文请用“保存帖子到SRL”。',
+      '没有找到可导入的 Discord 附件直链。支持 PNG、JSON、ZIP、TXT、聊天文件和图片；保存正文请用“保存帖子到SRL（云端暂存）”。',
     )
   if (files.length > 20 || files.some((file) => file.size > MAX_SIZE))
     throw new InboxError(400, '一次最多下载 20 个文件，单文件最多 4 GiB')
@@ -132,8 +140,8 @@ export async function createResourceJobs(
        WHERE EXISTS (SELECT 1 FROM inbox_endpoints WHERE library_id = ? AND discord_user_id = ? AND is_default = 1 AND revoked_at IS NULL)
        ON CONFLICT(library_id, fingerprint) DO UPDATE SET
          url = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' ELSE excluded.url END,
-         channel_id = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' ELSE excluded.channel_id END,
-         message_id = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' ELSE excluded.message_id END,
+         channel_id = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' WHEN excluded.message_id = '' THEN inbox_resources.channel_id ELSE excluded.channel_id END,
+         message_id = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' WHEN excluded.message_id = '' THEN inbox_resources.message_id ELSE excluded.message_id END,
          state = CASE WHEN inbox_resources.state IN ('failed','cancelled') OR inbox_resources.expires_at <= excluded.created_at THEN 'queued' ELSE inbox_resources.state END,
          error = CASE WHEN inbox_resources.state IN ('failed','cancelled') THEN NULL ELSE inbox_resources.error END,
          updated_at = excluded.updated_at, expires_at = excluded.expires_at`,
@@ -141,8 +149,8 @@ export async function createResourceJobs(
         crypto.randomUUID(),
         target.library_id,
         fingerprint,
-        channelId,
-        messageId,
+        direct ? '' : channelId!,
+        direct ? '' : messageId!,
         file.url,
         file.name,
         file.size,
@@ -190,19 +198,23 @@ async function freshAttachment(job: ResourceJob, env: Env): Promise<Attachment> 
     (/^[a-f\d]+$/iu.test(expiry) && Number.parseInt(expiry, 16) * 1_000 > Date.now() + 60_000)
   )
     return original
+  if (!validSnowflake(job.channel_id) || !validSnowflake(job.message_id))
+    throw new InboxError(410, '直链已过期，请重新复制有效下载链接并执行 /下载直链。')
   // Only reread the explicitly selected message; never scan other comments.
   const response = await fetch(
     `https://discord.com/api/v10/channels/${job.channel_id}/messages/${job.message_id}`,
     {
       headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
-      redirect: 'error',
+      redirect: 'manual',
     },
   )
-  if (!response.ok)
+  if (!response.ok) {
+    await response.body?.cancel()
     throw new InboxError(
       410,
-      '附件直链已过期，Bot 无法刷新。请回 Discord 对原消息重新执行“下载资源到SRL”。',
+      '附件直链已过期，Bot 无法刷新。请回 Discord 对原消息重新执行“下载资源到SRL（云端暂存）”。',
     )
+  }
   const message = asRecord(await response.json())
   const fresh =
     message && messageAttachments(message).find((file) => file.identity === original.identity)
@@ -218,16 +230,29 @@ async function freshAttachment(job: ResourceJob, env: Env): Promise<Attachment> 
 }
 
 export async function handleResourceRequest(request: Request, env: Env): Promise<Response> {
+  let stage = 'authenticate'
   try {
     const target = await authenticatedEndpoint(request, env)
+    stage = 'read_task'
     const path = new URL(request.url).pathname
     const now = Date.now()
     if (path === '/inbox/resources' && request.method === 'GET') {
+      const after = new URL(request.url).searchParams.get('after')
+      const cursor = after === null ? undefined : /^(\d{1,13}):([a-f\d-]{36})$/u.exec(after)
+      if (after !== null && !cursor) throw new InboxError(400, 'invalid_resource_cursor')
       const rows = await env.DB.prepare(
         `SELECT * FROM inbox_resources WHERE library_id = ? AND expires_at > ?
+         AND (created_at > ? OR (created_at = ? AND id > ?))
          AND state NOT IN ('imported','failed','cancelled') ORDER BY created_at, id LIMIT ?`,
       )
-        .bind(target.library_id, now, PAGE + 1)
+        .bind(
+          target.library_id,
+          now,
+          Number(cursor?.[1] ?? 0),
+          Number(cursor?.[1] ?? 0),
+          cursor?.[2] ?? '',
+          PAGE + 1,
+        )
         .all<ResourceJob>()
       const recent = await env.DB.prepare(
         `SELECT * FROM inbox_resources WHERE library_id = ? AND expires_at > ?
@@ -250,6 +275,7 @@ export async function handleResourceRequest(request: Request, env: Env): Promise
       .first<ResourceJob>()
     if (!job) throw new InboxError(404, 'resource_task_not_found_or_expired')
     if (request.method === 'POST' && match[2] === 'ack') {
+      stage = 'acknowledge'
       const body = await requestBody(request)
       if (!(STATES as readonly unknown[]).includes(body.state))
         throw new InboxError(400, 'invalid_state')
@@ -283,14 +309,18 @@ export async function handleResourceRequest(request: Request, env: Env): Promise
     if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, { status: 405 })
     if (job.state === 'imported')
       return json({ error: 'resource_already_imported', state: job.state }, { status: 409 })
+    stage = 'resolve_attachment'
     const file = await freshAttachment(job, env)
     if (!match[2]) return json({ ...summary(job), url: file.url })
+    stage = 'download_attachment'
     const response = await fetch(file.url, {
-      redirect: 'error',
+      redirect: 'manual',
       headers: { 'Accept-Encoding': 'identity' },
     })
-    if (!response.ok || !response.body)
+    if (!response.ok || !response.body) {
+      await response.body?.cancel()
       throw new InboxError(502, '附件下载失败，请重试或重新发送直链')
+    }
     if (response.headers.get('content-type')?.toLowerCase().startsWith('text/html')) {
       await response.body.cancel()
       throw new InboxError(422, '链接返回网页，未作为资源导入')
@@ -307,6 +337,24 @@ export async function handleResourceRequest(request: Request, env: Env): Promise
     // Pass the CDN stream through without materializing binary contents in D1 or Worker memory.
     return new Response(response.body, { headers })
   } catch (error) {
+    if (!(error instanceof InboxError)) {
+      let message = error instanceof Error ? error.message : 'Unknown error'
+      const credentials = [
+        env.DISCORD_BOT_TOKEN,
+        request.headers.get('Authorization')?.replace(/^Bearer\s+/iu, ''),
+      ]
+      for (const credential of credentials)
+        if (credential) message = message.replaceAll(credential, '[credential]')
+      message = message
+        .replace(/https?:\/\/[^\s"'<>]+/giu, '[url]')
+        .replace(/[\w.+-]+@[\w.-]+\.[a-z]{2,}/giu, '[email]')
+        .slice(0, 240)
+      console.error('Discord resource request failed', {
+        stage,
+        name: error instanceof Error ? error.name : 'UnknownError',
+        message,
+      })
+    }
     return inboxErrorResponse(error)
   }
 }

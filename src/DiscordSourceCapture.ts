@@ -106,10 +106,13 @@ async function readTextAttachment(
     const response = await fetch(url, {
       method: 'GET',
       cache: 'no-store',
-      redirect: 'error',
+      redirect: 'manual',
       signal: controller.signal,
     })
-    if (!response.ok || !response.body) return undefined
+    if (!response.ok || !response.body) {
+      await response.body?.cancel()
+      return undefined
+    }
     const contentLength = Number(response.headers.get('content-length'))
     if (Number.isFinite(contentLength) && contentLength > maxBytes) {
       await response.body.cancel()
