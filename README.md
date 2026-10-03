@@ -8,6 +8,24 @@ The Bridge is intentionally isolated from the SRL application. Each user deploys
 
 ## What it does
 
+SRL supports paired temporary queues: `保存帖子到SRL` saves a selected post;
+`下载资源到SRL` extracts supported Discord attachment links into a separate resource
+queue. `/绑定资源库` uses a ten-minute one-time pairing code from SRL. Both queues
+target the paired library and retain tasks for seven days. Legacy `保存到资源库`
+and its one-time handoff remain available.
+
+Cloud acceptance and local saving are separate states. SRL confirms a post only
+after saving and reading it back locally. Reclaiming a task or using its manual
+handoff does not create a second local copy of the same message.
+
+Resource files use the existing Android WorkManager download transport or an
+authenticated streaming Worker response for Web/iOS. Binary files are not stored
+in D1. The local importer owns content deduplication and version decisions; a
+downloaded file is not reported as imported until that importer commits.
+iOS requires an open page. Android can continue an already claimed native download;
+receiving new jobs and resuming parsing after process termination require reopening
+SRL. No push or headless import service is included.
+
 ```text
 Discord Message Context Command
   → your Cloudflare Worker
@@ -50,11 +68,35 @@ The D1 binding name is fixed to `DB`.
 - `POST /interactions` — Discord Interactions Endpoint
 - `GET /health` — checks that the D1 `handoffs` table is queryable and reports whether each Discord variable is present (never returns secret values)
 - `GET /setup/status` — checks that the Bot Token is valid, verifies the configured Application ID and Public Key belong to that Discord App, and reports Message Command registration
-- `POST /setup/register` — registers the `保存到资源库` Message Context Command
+- `POST /setup/register` — registers the legacy/post/resource Message Commands and the pairing Slash Command
 - `POST /source/read` — authenticated, bounded, read-only source check used by SRL
 - `POST /source/messages/check` — checks a bounded batch of explicitly saved message IDs
 - `GET /handoff/:token` — one-time SRL handoff
 - `GET /open/:token` — opens SRL with the handoff token
+- `GET /handoff/:token/status` — reads the handoff receipt state
+- `POST /handoff/:token/ack` — confirms a paired post after local saving
+- `POST /inbox/pair` — creates a library endpoint and one-time pairing code
+- `GET /inbox/status` — checks the paired library endpoint
+- `DELETE /inbox/pair` — revokes that endpoint
+- `GET /inbox/jobs` — lists pending posts and recent receipts in bounded pages
+- `GET /inbox/jobs/:id` — reads a post without consuming it before local saving
+- `POST /inbox/jobs/:id/ack` — confirms `saved` or `waiting_binding`
+- `GET /inbox/waiting-sources` — lists saved posts awaiting a local resource binding
+- `POST /inbox/sources/:sourceKeyHash/ack-bound` — updates receipts after local binding
+- `GET /inbox/resources` — lists resource download tasks and recent receipts
+- `GET /inbox/resources/:id` — reads a task and its validated/refreshed Discord URL
+- `GET /inbox/resources/:id/file` — streams the authenticated CDN response without redirects
+- `POST /inbox/resources/:id/ack` — updates local download/import/version-choice status
+
+Authenticated inbox routes require the endpoint secret and `X-SRL-Library-ID`
+header. Creating a pairing code requires the configured Bot Token. Tasks keep
+their original target library even when the default pairing changes.
+
+Resource downloads accept only HTTPS Discord CDN attachment paths. Refreshing an
+expired URL requires Bot access to the original message; otherwise SRL asks the
+user to resend. Apply migrations `0002_inbox.sql` and `0003_resources.sql` along
+with `0001_handoffs.sql` before deploying. The existing deploy script applies all
+pending migrations; Dashboard-generated code initializes the same schema.
 
 Users normally do not need to type these routes. SRL derives them automatically from the Worker root URL. For Android and iOS web apps / PWAs, the `/open/:token` page can copy a temporary link to paste inside the app; this keeps the handoff in that app's own local storage context and does not require an SRL site URL setting. Large handoffs are split across temporary D1 rows, so there is no Bridge-specific per-handoff size cap; Cloudflare account and database quotas still apply.
 
@@ -67,6 +109,10 @@ SRL also provides a browser-only Cloudflare deployment guide. It generates a Qui
 ## Privacy boundary
 
 This repository contains no SRL library data, no Discord credentials and no user content. Credentials are supplied by each user to their own Cloudflare deployment. Discord Message Context Command payloads are kept only long enough to complete the one-time handoff to the user's local SRL. Large payloads use multiple temporary D1 rows and are deleted under the same expiry and one-time-use rules. The Bridge can read up to two `.txt` attachments per message, at up to 1 MB each and 2 MB total per request, from Discord's HTTPS CDN; the client keeps that text in the local source record. Other attachments remain links. Source-refresh reads are initiated by the user, returned directly to SRL, and are not stored by the Bridge.
+
+Paired post captures and resource task metadata expire after seven days. Library
+endpoint secrets are stored as hashes in D1. Downloaded binary files and local
+resource bindings stay on the client; the Bridge stores no permanent resource files.
 
 ## Development
 
@@ -93,5 +139,9 @@ be committed to Git.
 > Cloudflare Workers Builds runs `npm run typecheck` and then `npm run deploy`; preview builds are
 > disabled. The first post-reconnection build succeeded: typecheck passed, no D1 migrations were
 > pending, and Worker version `a7835cb5-73bd-417e-962d-d7d4d3685f1d` was deployed.
+
+After updating this repository and SRL, use SRL's connection settings to register
+the Discord commands again. Deploying the Worker alone does not register commands
+with Discord. Update the Android shell before enabling native resource intake.
 
 This repository does not provide a shared production Worker. Deploy the Worker to your own Cloudflare account and configure your Worker root URL in SRL.
