@@ -261,6 +261,8 @@ async function deliveryPayload(
 ): Promise<Response> {
   if (delivery.expires_at <= Date.now())
     return json({ error: 'delivery_expired', state: 'expired' }, { status: 410 })
+  if (delivery.state !== 'pending')
+    return json({ error: 'delivery_already_saved', state: delivery.state }, { status: 409 })
   const handoff = await env.DB.prepare(
     'SELECT payload FROM handoffs WHERE token_hash = ? AND expires_at > ?',
   )
@@ -286,6 +288,32 @@ async function deliveryPayload(
   })
 }
 
+function acknowledgedPayloadDeletion(
+  env: Env,
+  scope?: { deliveryId: string; libraryId: string; now: number },
+): D1PreparedStatement {
+  const statement = env.DB.prepare(
+    `WITH acknowledged AS (
+      SELECT id, handoff_token_hash FROM inbox_deliveries
+      WHERE state IN ('saved', 'waiting_binding')
+      ${
+        scope
+          ? `AND id = ? AND claimed_library_id = ? AND expires_at > ?
+        AND (library_id IS NULL OR EXISTS (SELECT 1 FROM inbox_endpoints e
+          WHERE e.library_id = inbox_deliveries.library_id AND e.revoked_at IS NULL))`
+          : ''
+      }
+    ), payloads AS (
+      SELECT handoff_token_hash AS token_hash FROM acknowledged
+      UNION SELECT l.token_hash FROM inbox_delivery_links l JOIN acknowledged a ON a.id = l.delivery_id
+    ) DELETE FROM handoffs
+      WHERE token_hash IN (SELECT token_hash FROM payloads)
+        OR (token_hash LIKE '%:chunk:%' AND
+          substr(token_hash, 1, instr(token_hash, ':chunk:') - 1) IN (SELECT token_hash FROM payloads))`,
+  )
+  return scope ? statement.bind(scope.deliveryId, scope.libraryId, scope.now) : statement
+}
+
 async function acknowledge(
   env: Env,
   delivery: Delivery,
@@ -295,8 +323,11 @@ async function acknowledge(
   if (!LIBRARY_PATTERN.test(libraryId)) throw new InboxError(400, 'invalid_library_id')
   const state = body.state
   if (state !== 'saved' && state !== 'waiting_binding') throw new InboxError(400, 'invalid_state')
-  const result = await env.DB.prepare(
-    `UPDATE inbox_deliveries
+  const now = Date.now()
+  // Local persistence was verified before ACK; purge body/chunks atomically with its receipt.
+  const result = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE inbox_deliveries
      SET state = CASE WHEN state = 'saved' THEN 'saved' ELSE ? END,
          acknowledged_at = COALESCE(acknowledged_at, ?),
          claimed_library_id = COALESCE(claimed_library_id, ?)
@@ -304,10 +335,10 @@ async function acknowledge(
        (library_id = ? OR (library_id IS NULL AND (claimed_library_id IS NULL OR claimed_library_id = ?)))
        AND (library_id IS NULL OR EXISTS (SELECT 1 FROM inbox_endpoints e
          WHERE e.library_id = inbox_deliveries.library_id AND e.revoked_at IS NULL))`,
-  )
-    .bind(state, Date.now(), libraryId, delivery.id, Date.now(), libraryId, libraryId)
-    .run()
-  if (!result.meta.changes) throw new InboxError(409, 'delivery_target_mismatch_or_expired')
+    ).bind(state, now, libraryId, delivery.id, now, libraryId, libraryId),
+    acknowledgedPayloadDeletion(env, { deliveryId: delivery.id, libraryId, now }),
+  ])
+  if (!result[0]?.meta.changes) throw new InboxError(409, 'delivery_target_mismatch_or_expired')
   const receipt = await env.DB.prepare('SELECT state FROM inbox_deliveries WHERE id = ?')
     .bind(delivery.id)
     .first<{ state: DeliveryState }>()
@@ -349,6 +380,7 @@ export async function cleanupInbox(env: Env, now: number): Promise<void> {
     env.DB.prepare('DELETE FROM inbox_pair_codes WHERE expires_at <= ?').bind(now),
     env.DB.prepare('DELETE FROM inbox_deliveries WHERE expires_at <= ?').bind(now),
   ])
+  await acknowledgedPayloadDeletion(env).run()
 }
 
 function listItem(delivery: Delivery) {

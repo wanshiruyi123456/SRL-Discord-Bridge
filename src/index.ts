@@ -49,9 +49,10 @@ function handoffTtlSeconds(env: Env): number {
 
 async function cleanupExpired(env: Env): Promise<void> {
   const now = Date.now()
-  await env.DB.batch([
-    env.DB.prepare(
-      `DELETE FROM handoffs
+  const results = await Promise.allSettled([
+    env.DB.batch([
+      env.DB.prepare(
+        `DELETE FROM handoffs
        WHERE token_hash LIKE '%:chunk:%'
          AND (
            expires_at <= ? OR
@@ -61,13 +62,20 @@ async function cleanupExpired(env: Env): Promise<void> {
                AND (expires_at <= ? OR (consumed_at IS NOT NULL AND consumed_at <= ?))
            )
          )`,
-    ).bind(now, now, now - 60_000),
-    env.DB.prepare(
-      'DELETE FROM handoffs WHERE expires_at <= ? OR (consumed_at IS NOT NULL AND consumed_at <= ?)',
-    ).bind(now, now - 60_000),
+      ).bind(now, now, now - 60_000),
+      env.DB.prepare(
+        'DELETE FROM handoffs WHERE expires_at <= ? OR (consumed_at IS NOT NULL AND consumed_at <= ?)',
+      ).bind(now, now - 60_000),
+    ]),
+    cleanupInbox(env, now),
+    cleanupResources(env, now),
   ])
-  await cleanupInbox(env, now)
-  await cleanupResources(env, now)
+  const failures = results.filter((result) => result.status === 'rejected')
+  if (failures.length)
+    throw new AggregateError(
+      failures.map((failure) => failure.reason),
+      'Discord transport cleanup incomplete',
+    )
 }
 
 function splitHandoffPayload(payload: string): string[] {
@@ -572,6 +580,9 @@ async function readRequestedApplicationId(request: Request): Promise<string | un
 }
 
 export default {
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await cleanupExpired(env)
+  },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
     if (request.method === 'OPTIONS')

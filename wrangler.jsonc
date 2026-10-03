@@ -3,6 +3,9 @@
   "name": "srl-discord-source-bridge",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-26",
+  "triggers": {
+    "crons": ["0 * * * *"],
+  },
   "d1_databases": [
     {
       "binding": "DB",

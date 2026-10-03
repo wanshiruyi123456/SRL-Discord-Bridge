@@ -130,8 +130,10 @@ export async function createResourceJobs(
        (id, library_id, fingerprint, channel_id, message_id, url, name, size, created_at, updated_at, expires_at)
        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE EXISTS (SELECT 1 FROM inbox_endpoints WHERE library_id = ? AND discord_user_id = ? AND is_default = 1 AND revoked_at IS NULL)
-       ON CONFLICT(library_id, fingerprint) DO UPDATE SET url = excluded.url,
-         channel_id = excluded.channel_id, message_id = excluded.message_id,
+       ON CONFLICT(library_id, fingerprint) DO UPDATE SET
+         url = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' ELSE excluded.url END,
+         channel_id = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' ELSE excluded.channel_id END,
+         message_id = CASE WHEN inbox_resources.state = 'imported' AND inbox_resources.expires_at > excluded.created_at THEN '' ELSE excluded.message_id END,
          state = CASE WHEN inbox_resources.state IN ('failed','cancelled') OR inbox_resources.expires_at <= excluded.created_at THEN 'queued' ELSE inbox_resources.state END,
          error = CASE WHEN inbox_resources.state IN ('failed','cancelled') THEN NULL ELSE inbox_resources.error END,
          updated_at = excluded.updated_at, expires_at = excluded.expires_at`,
@@ -254,14 +256,33 @@ export async function handleResourceRequest(request: Request, env: Env): Promise
       const error = typeof body.error === 'string' ? body.error.slice(0, 300) : null
       // A stale download/error callback cannot turn an already committed import into failure.
       await env.DB.prepare(
-        `UPDATE inbox_resources SET state = ?, error = ?, updated_at = ?
-        WHERE id = ? AND library_id = ? AND state <> 'imported' AND expires_at > ?`,
+        `UPDATE inbox_resources SET
+          state = CASE WHEN state = 'imported' THEN state ELSE ? END,
+          error = CASE WHEN state = 'imported' OR ? = 'imported' THEN NULL ELSE ? END,
+          url = CASE WHEN state = 'imported' OR ? = 'imported' THEN '' ELSE url END,
+          channel_id = CASE WHEN state = 'imported' OR ? = 'imported' THEN '' ELSE channel_id END,
+          message_id = CASE WHEN state = 'imported' OR ? = 'imported' THEN '' ELSE message_id END,
+          updated_at = ?
+        WHERE id = ? AND library_id = ? AND expires_at > ?`,
       )
-        .bind(body.state, error, now, job.id, target.library_id, now)
+        .bind(
+          body.state,
+          body.state,
+          error,
+          body.state,
+          body.state,
+          body.state,
+          now,
+          job.id,
+          target.library_id,
+          now,
+        )
         .run()
       return json({ ok: true })
     }
     if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, { status: 405 })
+    if (job.state === 'imported')
+      return json({ error: 'resource_already_imported', state: job.state }, { status: 409 })
     const file = await freshAttachment(job, env)
     if (!match[2]) return json({ ...summary(job), url: file.url })
     const response = await fetch(file.url, {
@@ -292,4 +313,7 @@ export async function handleResourceRequest(request: Request, env: Env): Promise
 
 export async function cleanupResources(env: Env, now: number): Promise<void> {
   await env.DB.prepare('DELETE FROM inbox_resources WHERE expires_at <= ?').bind(now).run()
+  await env.DB.prepare(
+    "UPDATE inbox_resources SET url = '', channel_id = '', message_id = '', error = NULL WHERE state = 'imported' AND (url <> '' OR channel_id <> '' OR message_id <> '' OR error IS NOT NULL)",
+  ).run()
 }
