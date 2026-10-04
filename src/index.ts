@@ -298,8 +298,8 @@ async function registerMessageCommand(env: Env): Promise<void> {
     {
       name: PASTE_INBOX_COMMAND_NAME,
       type: 1,
-      description: '粘贴 Discord 消息正文，保存帖子并暂存其中的附件直链',
-      contexts: [2],
+      description: '从粘贴的 Discord 消息正文提取附件并暂存到资源库',
+      contexts: [0, 1, 2],
       options: [
         {
           name: '正文内容',
@@ -685,11 +685,6 @@ async function handleInteraction(
     interaction.data?.type === 1 &&
     commandName === PASTE_INBOX_COMMAND_NAME
   ) {
-    if (interaction.context !== 2)
-      return json({
-        type: 4,
-        data: { content: '“粘贴收件”仅在 Discord 私聊中可用。', flags: 64 },
-      })
     if (!interaction.token || !interactionUserId(interaction))
       return json({
         type: 4,

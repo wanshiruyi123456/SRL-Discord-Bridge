@@ -53,13 +53,18 @@ function attachment(value: unknown, size = 0): Attachment | undefined {
       url.username ||
       url.password ||
       !['cdn.discordapp.com', 'media.discordapp.net'].includes(url.hostname) ||
-      !/^\/attachments\/\d+\/\d+\/[^/]+$/u.test(url.pathname)
+      url.pathname.length <= 1
     )
       return undefined
-    const name = decodeURIComponent(url.pathname.split('/').at(-1)!)
-      .replace(/[\\/:*?"<>|\p{Cc}]/gu, '_')
-      .slice(0, 240)
-    if (!/\.(png|json|zip|txt|srlchat|webp|jpe?g)$/iu.test(name)) return undefined
+    const encodedName = url.pathname.split('/').at(-1) || ''
+    let decodedName = encodedName
+    try {
+      decodedName = decodeURIComponent(encodedName)
+    } catch {
+      // Keep the encoded final path segment, matching Android's shared-URL parser.
+    }
+    const name =
+      decodedName.replace(/[\\/:*?"<>|\p{Cc}]/gu, '_').slice(0, 240) || 'discord-attachment'
     url.hash = ''
     const identity = new URL(url)
     for (const key of ['ex', 'is', 'hm']) identity.searchParams.delete(key)
