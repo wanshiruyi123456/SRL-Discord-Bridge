@@ -11,6 +11,7 @@ import {
 import { DiscordInteraction, Env } from './DiscordSourceProtocol'
 import {
   cleanupInbox,
+  InboxError,
   createInboxDelivery,
   handleInboxHandoff,
   handleInboxRequest,
@@ -19,7 +20,12 @@ import {
   pairDiscordUser,
 } from './DiscordInbox'
 import { discordJson, handleSavedMessageCheck, handleSourceRead } from './DiscordSourceReader'
-import { cleanupResources, createResourceJobs, handleResourceRequest } from './DiscordResources'
+import {
+  cleanupResources,
+  createResourceJobs,
+  handleResourceRequest,
+  queuePastedResourceLinks,
+} from './DiscordResources'
 import {
   CORS_HEADERS,
   authorizedSetup,
@@ -35,6 +41,7 @@ const COMMAND_NAME = '保存到资源库'
 const POST_COMMAND_NAME = '保存帖子到SRL（云端暂存）'
 const RESOURCE_COMMAND_NAME = '下载资源到SRL（云端暂存）'
 const DIRECT_RESOURCE_COMMAND_NAME = '下载直链'
+const PASTE_INBOX_COMMAND_NAME = '粘贴收件'
 const PAIR_COMMAND_NAME = '绑定资源库'
 const INLINE_HANDOFF_MAX_BYTES = 1_800_000
 const HANDOFF_CHUNK_CHARACTERS = 250_000
@@ -213,6 +220,67 @@ async function readCurrentBotApplication(env: Env): Promise<Record<string, unkno
   return application
 }
 
+async function commandRegistrationFailure(response: Response, name: string): Promise<Error> {
+  const body = asRecord(await response.json().catch(() => undefined))
+  const code = asNumber(body?.code)
+  const retryAfter = asNumber(body?.retry_after)
+  const errors = asRecord(body?.errors)
+  const fields = ['name', 'description', 'options', 'integration_types', 'contexts'].filter(
+    (field) => errors?.[field] !== undefined,
+  )
+  // Fixed command names, numeric codes and known field names only; never upstream text or secrets.
+  console.warn('Discord command registration rejected', {
+    command: name,
+    status: response.status,
+    code,
+    fields,
+    retryAfter,
+  })
+  return new Error(
+    `Discord 指令「${name}」注册失败（HTTP ${response.status}${code !== undefined ? `，错误码 ${code}` : ''}${fields.length ? `，字段 ${fields.join('、')}` : ''}）${response.status === 429 ? `；请${retryAfter !== undefined ? `等待 ${Math.ceil(retryAfter)} 秒后` : '稍后'}再注册` : ''}`,
+  )
+}
+
+function commandMatches(actual: unknown, expected: unknown): boolean {
+  if (Array.isArray(expected))
+    return (
+      Array.isArray(actual) &&
+      actual.length === expected.length &&
+      expected.every((item, index) => commandMatches(actual[index], item))
+    )
+  const record = asRecord(expected)
+  if (record) {
+    const candidate = asRecord(actual)
+    return Boolean(
+      candidate &&
+      Object.entries(record).every(([key, value]) => commandMatches(candidate[key], value)),
+    )
+  }
+  return actual === expected
+}
+
+async function writeDiscordCommand(url: string, init: RequestInit): Promise<Response> {
+  let waited = 0
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await fetch(url, init)
+    if (response.status !== 429 || attempt >= 2) return response
+    const body = asRecord(
+      await response
+        .clone()
+        .json()
+        .catch(() => undefined),
+    )
+    const seconds = asNumber(body?.retry_after) ?? Number(response.headers.get('Retry-After'))
+    const milliseconds = Math.ceil(seconds * 1000)
+    // Existing SRL registration UI aborts at 8 seconds; never hold it for a long rate limit.
+    if (!Number.isFinite(milliseconds) || milliseconds <= 0 || waited + milliseconds > 4000)
+      return response
+    waited += milliseconds
+    await response.body?.cancel()
+    await new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
+  }
+}
+
 async function registerMessageCommand(env: Env): Promise<void> {
   if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_BOT_TOKEN) {
     throw new Error('Discord Application ID / Bot Token 未配置')
@@ -227,6 +295,21 @@ async function registerMessageCommand(env: Env): Promise<void> {
     [RESOURCE_COMMAND_NAME, '下载资源到SRL'],
   ])
   const commands = [
+    {
+      name: PASTE_INBOX_COMMAND_NAME,
+      type: 1,
+      description: '粘贴 Discord 消息正文，保存帖子并暂存其中的附件直链',
+      contexts: [2],
+      options: [
+        {
+          name: '正文内容',
+          type: 3,
+          description: '粘贴复制的消息正文，最多 4000 字符',
+          required: true,
+          max_length: 4000,
+        },
+      ],
+    },
     { name: COMMAND_NAME, type: 3 },
     { name: POST_COMMAND_NAME, type: 3 },
     { name: RESOURCE_COMMAND_NAME, type: 3 },
@@ -267,7 +350,16 @@ async function registerMessageCommand(env: Env): Promise<void> {
       return value?.name === command.name && value?.type === command.type
     })
     const migrate = oldCommand && !alreadyRenamed
-    const response = await fetch(
+    const payload = {
+      ...command,
+      integration_types: [1],
+      contexts: command.contexts ?? [0, 1, 2],
+    }
+    const current = existing
+      .map(asRecord)
+      .find((item) => item?.name === command.name && item?.type === command.type)
+    if (commandMatches(current, payload) && !oldCommand) continue
+    const response = await writeDiscordCommand(
       discordApplicationCommandsUrl(env) +
         (migrate ? '/' + encodeURIComponent(asString(oldCommand.id)) : ''),
       {
@@ -276,15 +368,11 @@ async function registerMessageCommand(env: Env): Promise<void> {
           Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          ...command,
-          integration_types: [1],
-          contexts: [0, 1, 2],
-        }),
+        body: JSON.stringify(payload),
       },
     )
     if (!response.ok) {
-      throw new Error(`Discord command registration failed: ${response.status}`)
+      throw await commandRegistrationFailure(response, command.name)
     }
     if (oldCommand && alreadyRenamed) {
       const removed = await fetch(
@@ -297,6 +385,20 @@ async function registerMessageCommand(env: Env): Promise<void> {
       if (!removed.ok && removed.status !== 404)
         throw new Error(`Discord old command removal failed: ${removed.status}`)
     }
+  }
+  const removedCommands = new Set(['保存首楼帖子', '保存所有已标注信息'])
+  for (const oldCommand of existing.map(asRecord)) {
+    const id = asString(oldCommand?.id)
+    if (!id || oldCommand?.type !== 1 || !removedCommands.has(asString(oldCommand?.name))) continue
+    const response = await fetch(
+      discordApplicationCommandsUrl(env) + '/' + encodeURIComponent(id),
+      {
+        method: 'DELETE',
+        headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+      },
+    )
+    if (!response.ok && response.status !== 404)
+      throw new Error(`Discord obsolete command removal failed: ${response.status}`)
   }
 }
 
@@ -316,6 +418,7 @@ async function readMessageCommandStatus(env: Env): Promise<boolean> {
     [RESOURCE_COMMAND_NAME, 3],
     [DIRECT_RESOURCE_COMMAND_NAME, 1],
     [PAIR_COMMAND_NAME, 1],
+    [PASTE_INBOX_COMMAND_NAME, 1],
   ].every(([name, type]) =>
     payload.some((item) => {
       const command = asRecord(item)
@@ -375,6 +478,30 @@ async function finishInboxCommand(
       interaction,
       env,
       `操作失败：${error instanceof Error ? error.message : '请稍后重试'}`,
+    )
+  }
+}
+
+async function finishPastedInboxCommand(interaction: DiscordInteraction, env: Env): Promise<void> {
+  try {
+    const userId = interactionUserId(interaction)
+    const content = interaction.data?.options?.find(
+      (option) => option.name === '正文内容' && option.type === 3,
+    )?.value
+    if (!userId || typeof content !== 'string' || !content.trim() || content.length > 4_000)
+      throw new InboxError(400, '请粘贴 1–4000 字符的消息正文。')
+    const queued = await queuePastedResourceLinks(interaction, env, content)
+    if (!queued.count)
+      throw new InboxError(
+        400,
+        '正文中没有找到受支持的 Discord 附件直链；这条指令只下载附件，不保存帖子正文。',
+      )
+    await updateDeferredInteraction(interaction, env, queued.message)
+  } catch (error) {
+    await updateDeferredInteraction(
+      interaction,
+      env,
+      `附件解析失败：${error instanceof Error ? error.message : '请稍后重试'}`,
     )
   }
 }
@@ -553,6 +680,25 @@ async function handleInteraction(
   }
 
   const commandName = interaction.data?.name
+  if (
+    interaction.type === 2 &&
+    interaction.data?.type === 1 &&
+    commandName === PASTE_INBOX_COMMAND_NAME
+  ) {
+    if (interaction.context !== 2)
+      return json({
+        type: 4,
+        data: { content: '“粘贴收件”仅在 Discord 私聊中可用。', flags: 64 },
+      })
+    if (!interaction.token || !interactionUserId(interaction))
+      return json({
+        type: 4,
+        data: { content: '无法确认 Discord 命令身份，请重新操作。', flags: 64 },
+      })
+    ctx.waitUntil(finishPastedInboxCommand(interaction, env))
+    ctx.waitUntil(cleanupExpired(env).catch(() => console.error('Discord resource cleanup failed')))
+    return json({ type: 5, data: { flags: 64 } })
+  }
   const isPairCommand =
     interaction.type === 2 && interaction.data?.type === 1 && commandName === PAIR_COMMAND_NAME
   const isPostCommand =

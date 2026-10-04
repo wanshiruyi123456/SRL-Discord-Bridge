@@ -9,6 +9,7 @@ export interface Env {
 export interface DiscordInteraction {
   id?: string
   type: number
+  context?: number
   token?: string
   user?: { id?: string }
   member?: { user?: { id?: string } }

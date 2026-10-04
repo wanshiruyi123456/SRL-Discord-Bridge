@@ -169,12 +169,15 @@ export async function createInboxDelivery(
   fingerprint: string,
   store: InboxHandoffStore,
   capturedAt: number,
+  expectedLibraryId?: string,
 ): Promise<{ token: string; delivery: Delivery; paired: boolean }> {
   const endpoint = await env.DB.prepare(
     'SELECT library_id, name, discord_user_id, is_default FROM inbox_endpoints WHERE discord_user_id = ? AND revoked_at IS NULL AND is_default = 1',
   )
     .bind(userId)
     .first<Endpoint>()
+  if (expectedLibraryId && endpoint?.library_id !== expectedLibraryId)
+    throw new InboxError(409, '配对目标已改变，已停止投递，请重新执行。')
   const libraryId = endpoint?.library_id ?? null
   const scope = libraryId ?? `unpaired:${userId}`
   const now = Date.now()

@@ -46,7 +46,7 @@ interface ResourceJob {
 function attachment(value: unknown, size = 0): Attachment | undefined {
   if (typeof value !== 'string' || value.length > 4_096) return undefined
   try {
-    const url = new URL(value.replace(/[),.;!?\]}。，；！？]+$/u, ''))
+    const url = new URL(value.replace(/[),.;!?\]}>。，；！？]+$/u, ''))
     if (
       url.protocol !== 'https:' ||
       url.port ||
@@ -90,6 +90,10 @@ function messageAttachments(message: Record<string, unknown>): Attachment[] {
   return [...found.values()]
 }
 
+export function extractPastedResourceLinks(content: string): string[] {
+  return messageAttachments({ content }).map((file) => file.url)
+}
+
 export async function createResourceJobs(
   interaction: DiscordInteraction,
   env: Env,
@@ -116,6 +120,40 @@ export async function createResourceJobs(
     )
   if (files.length > 20 || files.some((file) => file.size > MAX_SIZE))
     throw new InboxError(400, '一次最多下载 20 个文件，单文件最多 4 GiB')
+  const result = await queueResourceFiles(
+    interaction,
+    env,
+    files,
+    direct ? '' : channelId!,
+    direct ? '' : messageId!,
+  )
+  return result.message
+}
+
+export async function queuePastedResourceLinks(
+  interaction: DiscordInteraction,
+  env: Env,
+  content: string,
+): Promise<{ count: number; message: string }> {
+  const files = extractPastedResourceLinks(content).flatMap((url) => {
+    const file = attachment(url)
+    return file ? [file] : []
+  })
+  if (!files.length) return { count: 0, message: '' }
+  if (files.length > 20 || files.some((file) => file.size > MAX_SIZE))
+    throw new InboxError(400, '正文中的附件超过限制：一次最多 20 个文件，单文件最多 4 GiB')
+  return queueResourceFiles(interaction, env, files, '', '')
+}
+
+async function queueResourceFiles(
+  interaction: DiscordInteraction,
+  env: Env,
+  files: Attachment[],
+  channelId: string,
+  messageId: string,
+): Promise<{ count: number; message: string }> {
+  const userId = interactionUserId(interaction)
+  if (!userId) throw new InboxError(400, '无法确认执行命令的 Discord 用户')
   const target = await env.DB.prepare(
     'SELECT library_id, name FROM inbox_endpoints WHERE discord_user_id = ? AND is_default = 1 AND revoked_at IS NULL',
   )
@@ -149,8 +187,8 @@ export async function createResourceJobs(
         crypto.randomUUID(),
         target.library_id,
         fingerprint,
-        direct ? '' : channelId!,
-        direct ? '' : messageId!,
+        channelId,
+        messageId,
         file.url,
         file.name,
         file.size,
@@ -170,9 +208,12 @@ export async function createResourceJobs(
   )
     .bind(target.library_id, ...fingerprints)
     .all<{ state: string }>()
-  return saved.results.every((row) => row.state === 'imported')
-    ? `这 ${files.length} 个文件已导入「${target.name}」，没有重复创建资源。`
-    : `已将 ${files.length} 个文件加入「${target.name}」的资源下载队列。回到资源库后自动领取，进度在“资源下载”中查看；云端任务保留 7 天。`
+  return {
+    count: files.length,
+    message: saved.results.every((row) => row.state === 'imported')
+      ? `这 ${files.length} 个文件已导入「${target.name}」，没有重复创建资源。`
+      : `已将 ${files.length} 个文件加入「${target.name}」的资源下载队列。回到资源库后自动领取，进度在“资源下载”中查看；云端任务保留 7 天。`,
+  }
 }
 
 function summary(job: ResourceJob) {
@@ -199,7 +240,10 @@ async function freshAttachment(job: ResourceJob, env: Env): Promise<Attachment> 
   )
     return original
   if (!validSnowflake(job.channel_id) || !validSnowflake(job.message_id))
-    throw new InboxError(410, '直链已过期，请重新复制有效下载链接并执行 /下载直链。')
+    throw new InboxError(
+      410,
+      '直链已过期，请重新复制有效下载链接并执行 /下载直链 或 /粘贴收件 重试。',
+    )
   // Only reread the explicitly selected message; never scan other comments.
   const response = await fetch(
     `https://discord.com/api/v10/channels/${job.channel_id}/messages/${job.message_id}`,

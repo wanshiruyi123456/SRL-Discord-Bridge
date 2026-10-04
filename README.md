@@ -14,6 +14,17 @@ post text. Only supported Discord CDN attachment URLs are accepted, not message 
 or arbitrary websites. Expired pasted links require a fresh URL; ephemeral messages
 cannot be reread by the Bot. Register commands again after updating the Worker.
 
+If you cannot use Discord's message Apps menu, copy the Bot message text and run
+`/粘贴收件 正文内容:<copied message text>` in a private Discord context. The command
+extracts supported Discord CDN attachment links and queues them in the paired library;
+it does not save the pasted post text. The Bot does not need access to the original
+server. Expired signed links must be copied again. `/下载直链` remains available for
+a single copied attachment URL.
+
+The unsupported `/保存首楼帖子` and `/保存所有已标注信息` commands have been removed.
+Register commands again after deploying this update to remove any old entries from the
+Discord App.
+
 SRL supports paired temporary queues: `保存帖子到SRL（云端暂存）` saves a selected post;
 `下载资源到SRL（云端暂存）` extracts supported Discord attachment links into a separate resource
 queue. `/绑定资源库` uses a ten-minute one-time pairing code from SRL. Both queues
@@ -176,3 +187,14 @@ the Discord commands again. Deploying the Worker alone does not register command
 with Discord. Update the Android shell before enabling native resource intake.
 
 This repository does not provide a shared production Worker. Deploy the Worker to your own Cloudflare account and configure your Worker root URL in SRL.
+
+Inside a forum/media post, `/保存首楼帖子` saves the starter without scrolling;
+`/保存所有已标注信息` saves the post's pinned messages (up to 200 per invocation).
+Both commands require an existing pairing and Bot channel/history access plus
+Message Content access. Pins use the paginated Discord pins API, not a scan of
+ordinary comments. Delivery reuses the post inbox and its deduplication. If a
+batch fails partway, its receipt reports the accepted count; rerunning reuses
+accepted snapshots. A changed pairing stops the batch instead of routing later
+messages to another library. Register commands again after deploying this update.
+SRL's thread navigation shows saved pinned snapshots under “已标注信息”; legacy
+snapshots need resaving or a successful update check to learn their pin state.

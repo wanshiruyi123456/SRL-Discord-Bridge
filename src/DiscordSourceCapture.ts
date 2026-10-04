@@ -212,6 +212,7 @@ export function buildCapture(interaction: DiscordInteraction): Record<string, un
     authorId,
     authorName,
     authorBot,
+    ...(typeof message.pinned === 'boolean' ? { pinned: message.pinned } : {}),
     content: typeof message.content === 'string' ? message.content : '',
     timestamp: asString(message.timestamp) || new Date().toISOString(),
     ...(asString(message.edited_timestamp)
@@ -254,6 +255,7 @@ export function buildCaptureFromMessage(
     authorId,
     authorName,
     authorBot,
+    ...(typeof message.pinned === 'boolean' ? { pinned: message.pinned } : {}),
     content: typeof message.content === 'string' ? message.content : '',
     timestamp: asString(message.timestamp) || new Date().toISOString(),
     ...(asString(message.edited_timestamp)
