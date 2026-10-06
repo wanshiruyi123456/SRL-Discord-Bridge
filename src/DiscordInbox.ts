@@ -317,6 +317,23 @@ function acknowledgedPayloadDeletion(
   return scope ? statement.bind(scope.deliveryId, scope.libraryId, scope.now) : statement
 }
 
+function cleanupCompletedHandoffPayloads(env: Env, libraryId: string, now: number) {
+  return env.DB.prepare(
+    `WITH acknowledged AS (
+      SELECT id, handoff_token_hash FROM inbox_deliveries
+      WHERE claimed_library_id = ? AND state IN ('saved', 'waiting_binding') AND expires_at > ?
+        AND (library_id IS NULL OR EXISTS (SELECT 1 FROM inbox_endpoints e
+          WHERE e.library_id = inbox_deliveries.library_id AND e.revoked_at IS NULL))
+    ), payloads AS (
+      SELECT handoff_token_hash AS token_hash FROM acknowledged
+      UNION SELECT l.token_hash FROM inbox_delivery_links l JOIN acknowledged a ON a.id = l.delivery_id
+    ) DELETE FROM handoffs
+      WHERE token_hash IN (SELECT token_hash FROM payloads)
+        OR (token_hash LIKE '%:chunk:%' AND
+          substr(token_hash, 1, instr(token_hash, ':chunk:') - 1) IN (SELECT token_hash FROM payloads))`,
+  ).bind(libraryId, now)
+}
+
 async function acknowledge(
   env: Env,
   delivery: Delivery,
@@ -444,6 +461,45 @@ export async function handleInboxRequest(
         .bind(Date.now(), endpoint.library_id)
         .run()
       return json({ ok: true })
+    }
+    if (
+      (path === '/inbox/cleanup' || path === '/inbox/cleanup-scoped') &&
+      request.method === 'DELETE'
+    ) {
+      const scoped = path === '/inbox/cleanup-scoped'
+      const body = scoped ? await requestBody(request) : undefined
+      const scope = scoped ? body?.scope : 'both'
+      if (scope !== 'posts' && scope !== 'resources' && scope !== 'both')
+        throw new InboxError(400, 'invalid_cleanup_scope')
+      const now = Date.now()
+      const statements: D1PreparedStatement[] = []
+      if (scope === 'posts' || scope === 'both') {
+        statements.push(
+          cleanupCompletedHandoffPayloads(env, endpoint.library_id, now),
+          env.DB.prepare(
+            `DELETE FROM inbox_deliveries WHERE claimed_library_id = ? AND state IN ('saved','waiting_binding') AND expires_at > ?
+           AND (library_id IS NULL OR EXISTS (SELECT 1 FROM inbox_endpoints e
+             WHERE e.library_id = inbox_deliveries.library_id AND e.revoked_at IS NULL))`,
+          ).bind(endpoint.library_id, now),
+        )
+      }
+      if (scope === 'resources' || scope === 'both') {
+        statements.push(
+          env.DB.prepare(
+            `DELETE FROM inbox_resources WHERE library_id = ? AND expires_at > ?
+           AND state = 'imported'`,
+          ).bind(endpoint.library_id, now),
+        )
+      }
+      const results = await env.DB.batch(statements)
+      const includesPosts = scope === 'posts' || scope === 'both'
+      const includesResources = scope === 'resources' || scope === 'both'
+      return json({
+        ok: true,
+        posts: includesPosts ? (results[1]?.meta.changes ?? 0) : 0,
+        resources: includesResources ? (results[includesPosts ? 2 : 0]?.meta.changes ?? 0) : 0,
+        payloadRows: includesPosts ? (results[0]?.meta.changes ?? 0) : 0,
+      })
     }
     if (path === '/inbox/jobs' && request.method === 'GET') {
       const now = Date.now()
