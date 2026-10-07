@@ -96,13 +96,17 @@ The D1 binding name is fixed to `DB`.
 - `POST /inbox/pair` — creates a library endpoint and one-time pairing code
 - `GET /inbox/status` — checks the paired library endpoint
 - `DELETE /inbox/pair` — revokes that endpoint
+- `DELETE /inbox/cleanup` — clears completed post and resource cloud records
+- `DELETE /inbox/cleanup-scoped` — clears only the requested `posts` or `resources` records
 - `GET /inbox/jobs` — lists pending posts and recent receipts in bounded pages
 - `GET /inbox/jobs/:id` — reads a post without consuming it before local saving
+- `DELETE /inbox/jobs/:id` — cancels a post that is still pending and removes its temporary payload
 - `POST /inbox/jobs/:id/ack` — confirms `saved` or `waiting_binding`
 - `GET /inbox/waiting-sources` — lists saved posts awaiting a local resource binding
 - `POST /inbox/sources/:sourceKeyHash/ack-bound` — updates receipts after local binding
 - `GET /inbox/resources` — lists resource download tasks and recent receipts
 - `GET /inbox/resources/:id` — reads a task and its validated/refreshed Discord URL
+- `DELETE /inbox/resources/:id` — clears a completed, failed, or cancelled resource task
 - `GET /inbox/resources/:id/file` — streams the authenticated CDN response without redirects
 - `POST /inbox/resources/:id/ack` — updates local download/import/version-choice status
 

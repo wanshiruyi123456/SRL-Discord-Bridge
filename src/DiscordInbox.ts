@@ -334,6 +334,21 @@ function cleanupCompletedHandoffPayloads(env: Env, libraryId: string, now: numbe
   ).bind(libraryId, now)
 }
 
+function deletePendingHandoffPayload(env: Env, id: string, libraryId: string, now: number) {
+  return env.DB.prepare(
+    `WITH pending AS (
+      SELECT id, handoff_token_hash FROM inbox_deliveries
+      WHERE id = ? AND library_id = ? AND state = 'pending' AND expires_at > ?
+    ), payloads AS (
+      SELECT handoff_token_hash AS token_hash FROM pending
+      UNION SELECT l.token_hash FROM inbox_delivery_links l JOIN pending p ON p.id = l.delivery_id
+    ) DELETE FROM handoffs
+      WHERE token_hash IN (SELECT token_hash FROM payloads)
+        OR (token_hash LIKE '%:chunk:%' AND
+          substr(token_hash, 1, instr(token_hash, ':chunk:') - 1) IN (SELECT token_hash FROM payloads))`,
+  ).bind(id, libraryId, now)
+}
+
 async function acknowledge(
   env: Env,
   delivery: Delivery,
@@ -558,6 +573,19 @@ export async function handleInboxRequest(
       if (!match[2] && request.method === 'GET') return await deliveryPayload(env, delivery, store)
       if (match[2] && request.method === 'POST')
         return await acknowledge(env, delivery, endpoint.library_id, await requestBody(request))
+      if (!match[2] && request.method === 'DELETE') {
+        if (delivery.state !== 'pending' || delivery.library_id !== endpoint.library_id)
+          throw new InboxError(409, 'delivery_no_longer_cancellable')
+        const now = Date.now()
+        const results = await env.DB.batch([
+          deletePendingHandoffPayload(env, delivery.id, endpoint.library_id, now),
+          env.DB.prepare(
+            `DELETE FROM inbox_deliveries WHERE id = ? AND library_id = ? AND state = 'pending' AND expires_at > ?`,
+          ).bind(delivery.id, endpoint.library_id, now),
+        ])
+        if (!results[1]?.meta.changes) throw new InboxError(409, 'delivery_changed_before_cancel')
+        return json({ ok: true })
+      }
     }
     return json({ error: 'not_found' }, { status: 404 })
   } catch (error) {

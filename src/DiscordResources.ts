@@ -323,11 +323,29 @@ export async function handleResourceRequest(request: Request, env: Env): Promise
       .bind(match[1], target.library_id, now)
       .first<ResourceJob>()
     if (!job) throw new InboxError(404, 'resource_task_not_found_or_expired')
+    if (request.method === 'DELETE' && !match[2]) {
+      stage = 'delete_task'
+      if (!['imported', 'failed', 'cancelled'].includes(job.state))
+        throw new InboxError(409, 'resource_task_must_be_finished_before_cleanup')
+      const deleted = await env.DB.prepare(
+        `DELETE FROM inbox_resources WHERE id = ? AND library_id = ? AND expires_at > ?
+         AND state IN ('imported','failed','cancelled')`,
+      )
+        .bind(job.id, target.library_id, now)
+        .run()
+      if (!deleted.meta.changes) throw new InboxError(409, 'resource_task_changed_before_cleanup')
+      return json({ ok: true })
+    }
     if (request.method === 'POST' && match[2] === 'ack') {
       stage = 'acknowledge'
       const body = await requestBody(request)
       if (!(STATES as readonly unknown[]).includes(body.state))
         throw new InboxError(400, 'invalid_state')
+      if (
+        body.state === 'cancelled' &&
+        !['queued', 'downloading', 'failed', 'cancelled'].includes(job.state)
+      )
+        throw new InboxError(409, 'resource_task_no_longer_cancellable')
       const error = typeof body.error === 'string' ? body.error.slice(0, 300) : null
       // A stale download/error callback cannot turn an already committed import into failure.
       await env.DB.prepare(
